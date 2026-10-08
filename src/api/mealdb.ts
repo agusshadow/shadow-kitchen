@@ -17,31 +17,55 @@ export class ApiError extends Error {
 
 const cache = new Map<string, Promise<unknown>>()
 
-async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
+/**
+ * El pedido compartido (cacheado) no se cancela por un solo llamador: si lo
+ * hiciera, otro que espera el mismo resultado quedaría colgado. La señal solo
+ * corta la espera de quien la pasó.
+ */
+function withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new DOMException('Aborted', 'AbortError'))
+    if (signal.aborted) return abort()
+    signal.addEventListener('abort', abort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', abort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort)
+        reject(error)
+      },
+    )
+  })
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(url)
+  } catch {
+    throw new ApiError()
+  }
+  if (!res.ok) throw new ApiError()
+  try {
+    return (await res.json()) as T
+  } catch {
+    throw new ApiError()
+  }
+}
+
+function request<T>(path: string, signal?: AbortSignal): Promise<T> {
   const url = `${BASE}/${path}`
-  const hit = cache.get(url)
-  if (hit) return hit as Promise<T>
-
-  const promise = (async () => {
-    let res: Response
-    try {
-      res = await fetch(url, { signal })
-    } catch (error) {
-      if ((error as Error).name === 'AbortError') throw error
-      throw new ApiError()
-    }
-    if (!res.ok) throw new ApiError()
-    try {
-      return (await res.json()) as T
-    } catch {
-      throw new ApiError()
-    }
-  })()
-
-  cache.set(url, promise)
-  // Si falla (o se cancela), no dejamos el error guardado: el próximo intento vuelve a pedirlo.
-  promise.catch(() => cache.delete(url))
-  return promise as Promise<T>
+  let promise = cache.get(url) as Promise<T> | undefined
+  if (!promise) {
+    promise = fetchJson<T>(url)
+    cache.set(url, promise)
+    // Si falla, no dejamos el error guardado: el próximo intento vuelve a pedirlo.
+    promise.catch(() => cache.delete(url))
+  }
+  return withSignal(promise, signal)
 }
 
 interface MealsResponse {
@@ -89,15 +113,7 @@ export async function getMeal(id: string, signal?: AbortSignal): Promise<Meal | 
 
 /** Receta al azar: no se cachea, para que cada pedido traiga una distinta. */
 export async function randomMeal(signal?: AbortSignal): Promise<Meal | null> {
-  let res: Response
-  try {
-    res = await fetch(`${BASE}/random.php`, { signal })
-  } catch (error) {
-    if ((error as Error).name === 'AbortError') throw error
-    throw new ApiError()
-  }
-  if (!res.ok) throw new ApiError()
-  const data = (await res.json()) as MealsResponse
+  const data = await withSignal(fetchJson<MealsResponse>(`${BASE}/random.php`), signal)
   const raw = data.meals?.[0]
   return raw ? parseMeal(raw) : null
 }
